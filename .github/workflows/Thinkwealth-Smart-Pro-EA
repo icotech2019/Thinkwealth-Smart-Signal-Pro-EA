@@ -1,0 +1,997 @@
+//+------------------------------------------------------------------+
+//| Thinkwealth Smart Signal Pro EA                                  |
+//| Version 1.0                                                      |
+//| Thinkwealth Forex Academy                                        |
+//|                                                                  |
+//| Strategy:                                                        |
+//| - EMA trend filter                                               |
+//| - MACD confirmation                                              |
+//| - Stochastic confirmation                                        |
+//| - ATR-based optional SL/TP                                       |
+//| - Risk-based position sizing                                     |
+//| - Spread filter                                                  |
+//| - Trading session filter                                         |
+//| - One position per symbol                                        |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "Thinkwealth Smart Signal Pro EA - Version 1"
+#property description "EMA + MACD + Stochastic trading system"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//====================================================================
+// INPUT SETTINGS
+//====================================================================
+
+//--- General
+input group "=== GENERAL SETTINGS ==="
+input ulong  MagicNumber       = 20260811;
+input bool   AllowBuy          = true;
+input bool   AllowSell         = true;
+input bool   OnePositionOnly   = true;
+
+//--- Risk Management
+input group "=== RISK MANAGEMENT ==="
+input bool   UseRiskPercent    = true;
+input double RiskPercent       = 1.0;
+input double FixedLot          = 0.01;
+input double MaxLot            = 5.00;
+
+//--- Stop Loss / Take Profit
+input group "=== STOP LOSS / TAKE PROFIT ==="
+input bool   UseATRStops       = true;
+input int    ATRPeriod         = 14;
+input double ATR_SL_Multiplier  = 1.5;
+input double ATR_TP_Multiplier  = 3.0;
+
+input int    FixedStopLossPips  = 50;
+input int    FixedTakeProfitPips= 100;
+
+//--- Trend Filter
+input group "=== TREND FILTER ==="
+input int    FastEMA            = 50;
+input int    SlowEMA            = 200;
+
+//--- MACD
+input group "=== MACD SETTINGS ==="
+input int    MACDFast           = 12;
+input int    MACDSlow           = 26;
+input int    MACDSignal         = 9;
+
+//--- Stochastic
+input group "=== STOCHASTIC SETTINGS ==="
+input int    StochK             = 5;
+input int    StochD             = 3;
+input int    StochSlowing       = 3;
+input double StochOversold      = 20.0;
+input double StochOverbought    = 80.0;
+
+//--- Spread
+input group "=== SPREAD FILTER ==="
+input bool   UseSpreadFilter    = true;
+input double MaxSpreadPips      = 3.0;
+
+//--- Trading Hours
+input group "=== TRADING HOURS ==="
+input bool   UseTradingHours    = false;
+input int    StartHour          = 7;
+input int    EndHour            = 20;
+
+//--- Trade Management
+input group "=== TRADE MANAGEMENT ==="
+input bool   UseBreakEven       = true;
+input int    BreakEvenPips      = 30;
+input int    BreakEvenLockPips  = 5;
+
+input bool   UseTrailingStop    = true;
+input int    TrailingStartPips  = 50;
+input int    TrailingStopPips   = 30;
+
+//====================================================================
+// INDICATOR HANDLES
+//====================================================================
+
+int hFastEMA = INVALID_HANDLE;
+int hSlowEMA = INVALID_HANDLE;
+int hMACD    = INVALID_HANDLE;
+int hStoch   = INVALID_HANDLE;
+int hATR     = INVALID_HANDLE;
+
+//====================================================================
+// GLOBAL VARIABLES
+//====================================================================
+
+datetime LastBarTime = 0;
+
+//====================================================================
+// PIP SIZE
+//====================================================================
+
+double PipSize()
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   if(digits == 3 || digits == 5)
+      return(_Point * 10.0);
+
+   return(_Point);
+}
+
+//====================================================================
+// NORMALIZE LOT
+//====================================================================
+
+double NormalizeLot(double lot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lotStep <= 0)
+      lotStep = 0.01;
+
+   lot = MathMax(lot, minLot);
+   lot = MathMin(lot, maxLot);
+   lot = MathMin(lot, MaxLot);
+
+   lot = MathFloor(lot / lotStep) * lotStep;
+
+   int volumeDigits = 2;
+
+   if(lotStep == 1.0)
+      volumeDigits = 0;
+   else if(lotStep == 0.1)
+      volumeDigits = 1;
+   else if(lotStep == 0.01)
+      volumeDigits = 2;
+   else if(lotStep == 0.001)
+      volumeDigits = 3;
+
+   return NormalizeDouble(lot, volumeDigits);
+}
+
+//====================================================================
+// CALCULATE LOT SIZE FROM RISK
+//====================================================================
+
+double CalculateLotSize(double stopDistance)
+{
+   if(!UseRiskPercent)
+      return NormalizeLot(FixedLot);
+
+   if(stopDistance <= 0)
+      return NormalizeLot(FixedLot);
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * RiskPercent / 100.0;
+
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+   if(tickSize <= 0 || tickValue <= 0)
+      return NormalizeLot(FixedLot);
+
+   double lossPerLot = (stopDistance / tickSize) * tickValue;
+
+   if(lossPerLot <= 0)
+      return NormalizeLot(FixedLot);
+
+   double lot = riskMoney / lossPerLot;
+
+   return NormalizeLot(lot);
+}
+
+//====================================================================
+// CHECK TRADING HOURS
+//====================================================================
+
+bool IsTradingHour()
+{
+   if(!UseTradingHours)
+      return true;
+
+   MqlDateTime currentTime;
+   TimeToStruct(TimeCurrent(), currentTime);
+
+   int hour = currentTime.hour;
+
+   if(StartHour < EndHour)
+   {
+      if(hour >= StartHour && hour < EndHour)
+         return true;
+   }
+   else
+   {
+      if(hour >= StartHour || hour < EndHour)
+         return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// CHECK SPREAD
+//====================================================================
+
+bool IsSpreadOK()
+{
+   if(!UseSpreadFilter)
+      return true;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(ask <= 0 || bid <= 0)
+      return false;
+
+   double spreadPips = (ask - bid) / PipSize();
+
+   return(spreadPips <= MaxSpreadPips);
+}
+
+//====================================================================
+// CHECK EXISTING POSITION
+//====================================================================
+
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol && magic == MagicNumber)
+         return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// GET INDICATOR VALUES
+//====================================================================
+
+bool GetIndicatorValues(
+   double &fastEMA,
+   double &slowEMA,
+   double &macdMain,
+   double &macdSignal,
+   double &stochMain,
+   double &stochSignal,
+   double &atrValue
+)
+{
+   double emaFastBuffer[3];
+   double emaSlowBuffer[3];
+
+   double macdMainBuffer[3];
+   double macdSignalBuffer[3];
+
+   double stochMainBuffer[3];
+   double stochSignalBuffer[3];
+
+   double atrBuffer[3];
+
+   ArraySetAsSeries(emaFastBuffer, true);
+   ArraySetAsSeries(emaSlowBuffer, true);
+   ArraySetAsSeries(macdMainBuffer, true);
+   ArraySetAsSeries(macdSignalBuffer, true);
+   ArraySetAsSeries(stochMainBuffer, true);
+   ArraySetAsSeries(stochSignalBuffer, true);
+   ArraySetAsSeries(atrBuffer, true);
+
+   if(CopyBuffer(hFastEMA, 0, 0, 3, emaFastBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(hSlowEMA, 0, 0, 3, emaSlowBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(hMACD, 0, 0, 3, macdMainBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(hMACD, 1, 0, 3, macdSignalBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(hStoch, 0, 0, 3, stochMainBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(hStoch, 1, 0, 3, stochSignalBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(hATR, 0, 0, 3, atrBuffer) < 3)
+      return false;
+
+   // Use the last completed candle
+   fastEMA    = emaFastBuffer[1];
+   slowEMA    = emaSlowBuffer[1];
+
+   macdMain   = macdMainBuffer[1];
+   macdSignal = macdSignalBuffer[1];
+
+   stochMain  = stochMainBuffer[1];
+   stochSignal= stochSignalBuffer[1];
+
+   atrValue   = atrBuffer[1];
+
+   return true;
+}
+
+//====================================================================
+// BUY SIGNAL
+//====================================================================
+
+bool BuySignal()
+{
+   double fastEMA;
+   double slowEMA;
+   double macdMain;
+   double macdSignal;
+   double stochMain;
+   double stochSignal;
+   double atrValue;
+
+   if(!GetIndicatorValues(
+      fastEMA,
+      slowEMA,
+      macdMain,
+      macdSignal,
+      stochMain,
+      stochSignal,
+      atrValue))
+      return false;
+
+   double closePrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   // Trend condition
+   bool bullishTrend = 
+      fastEMA > slowEMA &&
+      closePrice > fastEMA;
+
+   // MACD condition
+   bool bullishMACD =
+      macdMain > macdSignal &&
+      macdMain > 0;
+
+   // Stochastic condition
+   bool bullishStoch =
+      stochMain > stochSignal &&
+      stochMain < StochOverbought;
+
+   if(bullishTrend && bullishMACD && bullishStoch)
+      return true;
+
+   return false;
+}
+
+//====================================================================
+// SELL SIGNAL
+//====================================================================
+
+bool SellSignal()
+{
+   double fastEMA;
+   double slowEMA;
+   double macdMain;
+   double macdSignal;
+   double stochMain;
+   double stochSignal;
+   double atrValue;
+
+   if(!GetIndicatorValues(
+      fastEMA,
+      slowEMA,
+      macdMain,
+      macdSignal,
+      stochMain,
+      stochSignal,
+      atrValue))
+      return false;
+
+   double closePrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   // Trend condition
+   bool bearishTrend =
+      fastEMA < slowEMA &&
+      closePrice < fastEMA;
+
+   // MACD condition
+   bool bearishMACD =
+      macdMain < macdSignal &&
+      macdMain < 0;
+
+   // Stochastic condition
+   bool bearishStoch =
+      stochMain < stochSignal &&
+      stochMain > StochOversold;
+
+   if(bearishTrend && bearishMACD && bearishStoch)
+      return true;
+
+   return false;
+}
+
+//====================================================================
+// CALCULATE BUY SL
+//====================================================================
+
+double CalculateBuySL(double entryPrice, double atrValue)
+{
+   double slDistance;
+
+   if(UseATRStops && atrValue > 0)
+      slDistance = atrValue * ATR_SL_Multiplier;
+   else
+      slDistance = FixedStopLossPips * PipSize();
+
+   double sl = entryPrice - slDistance;
+
+   return NormalizeDouble(sl, _Digits);
+}
+
+//====================================================================
+// CALCULATE BUY TP
+//====================================================================
+
+double CalculateBuyTP(double entryPrice, double atrValue)
+{
+   double tpDistance;
+
+   if(UseATRStops && atrValue > 0)
+      tpDistance = atrValue * ATR_TP_Multiplier;
+   else
+      tpDistance = FixedTakeProfitPips * PipSize();
+
+   double tp = entryPrice + tpDistance;
+
+   return NormalizeDouble(tp, _Digits);
+}
+
+//====================================================================
+// CALCULATE SELL SL
+//====================================================================
+
+double CalculateSellSL(double entryPrice, double atrValue)
+{
+   double slDistance;
+
+   if(UseATRStops && atrValue > 0)
+      slDistance = atrValue * ATR_SL_Multiplier;
+   else
+      slDistance = FixedStopLossPips * PipSize();
+
+   double sl = entryPrice + slDistance;
+
+   return NormalizeDouble(sl, _Digits);
+}
+
+//====================================================================
+// CALCULATE SELL TP
+//====================================================================
+
+double CalculateSellTP(double entryPrice, double atrValue)
+{
+   double tpDistance;
+
+   if(UseATRStops && atrValue > 0)
+      tpDistance = atrValue * ATR_TP_Multiplier;
+   else
+      tpDistance = FixedTakeProfitPips * PipSize();
+
+   double tp = entryPrice - tpDistance;
+
+   return NormalizeDouble(tp, _Digits);
+}
+
+//====================================================================
+// OPEN BUY
+//====================================================================
+
+void OpenBuy()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(ask <= 0)
+      return;
+
+   double fastEMA;
+   double slowEMA;
+   double macdMain;
+   double macdSignal;
+   double stochMain;
+   double stochSignal;
+   double atrValue;
+
+   if(!GetIndicatorValues(
+      fastEMA,
+      slowEMA,
+      macdMain,
+      macdSignal,
+      stochMain,
+      stochSignal,
+      atrValue))
+      return;
+
+   double sl = CalculateBuySL(ask, atrValue);
+   double tp = CalculateBuyTP(ask, atrValue);
+
+   double stopDistance = ask - sl;
+
+   if(stopDistance <= 0)
+      return;
+
+   double lot = CalculateLotSize(stopDistance);
+
+   if(lot <= 0)
+      return;
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+
+   bool result = trade.Buy(
+      lot,
+      _Symbol,
+      ask,
+      sl,
+      tp,
+      "Thinkwealth BUY"
+   );
+
+   if(result)
+   {
+      Print(
+         "Thinkwealth EA BUY opened. Lot=",
+         lot,
+         " SL=",
+         sl,
+         " TP=",
+         tp
+      );
+   }
+   else
+   {
+      Print(
+         "BUY failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+   }
+}
+
+//====================================================================
+// OPEN SELL
+//====================================================================
+
+void OpenSell()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(bid <= 0)
+      return;
+
+   double fastEMA;
+   double slowEMA;
+   double macdMain;
+   double macdSignal;
+   double stochMain;
+   double stochSignal;
+   double atrValue;
+
+   if(!GetIndicatorValues(
+      fastEMA,
+      slowEMA,
+      macdMain,
+      macdSignal,
+      stochMain,
+      stochSignal,
+      atrValue))
+      return;
+
+   double sl = CalculateSellSL(bid, atrValue);
+   double tp = CalculateSellTP(bid, atrValue);
+
+   double stopDistance = sl - bid;
+
+   if(stopDistance <= 0)
+      return;
+
+   double lot = CalculateLotSize(stopDistance);
+
+   if(lot <= 0)
+      return;
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+
+   bool result = trade.Sell(
+      lot,
+      _Symbol,
+      bid,
+      sl,
+      tp,
+      "Thinkwealth SELL"
+   );
+
+   if(result)
+   {
+      Print(
+         "Thinkwealth EA SELL opened. Lot=",
+         lot,
+         " SL=",
+         sl,
+         " TP=",
+         tp
+      );
+   }
+   else
+   {
+      Print(
+         "SELL failed. Retcode=",
+         trade.ResultRetcode(),
+         " Description=",
+         trade.ResultRetcodeDescription()
+      );
+   }
+}
+
+//====================================================================
+// BREAK-EVEN MANAGEMENT
+//====================================================================
+
+void ManageBreakEven()
+{
+   if(!UseBreakEven)
+      return;
+
+   double pip = PipSize();
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol || magic != MagicNumber)
+         continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+
+      double currentPrice;
+
+      if(type == POSITION_TYPE_BUY)
+         currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      else
+         currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      double profitPips;
+
+      if(type == POSITION_TYPE_BUY)
+         profitPips = (currentPrice - openPrice) / pip;
+      else
+         profitPips = (openPrice - currentPrice) / pip;
+
+      if(profitPips < BreakEvenPips)
+         continue;
+
+      double newSL;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         newSL = openPrice + BreakEvenLockPips * pip;
+
+         if(currentSL == 0 || newSL > currentSL)
+         {
+            trade.PositionModify(
+               ticket,
+               NormalizeDouble(newSL, _Digits),
+               currentTP
+            );
+         }
+      }
+      else
+      {
+         newSL = openPrice - BreakEvenLockPips * pip;
+
+         if(currentSL == 0 || newSL < currentSL)
+         {
+            trade.PositionModify(
+               ticket,
+               NormalizeDouble(newSL, _Digits),
+               currentTP
+            );
+         }
+      }
+   }
+}
+
+//====================================================================
+// TRAILING STOP
+//====================================================================
+
+void ManageTrailingStop()
+{
+   if(!UseTrailingStop)
+      return;
+
+   double pip = PipSize();
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ulong magic   = (ulong)PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol || magic != MagicNumber)
+         continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+
+      double currentPrice;
+
+      if(type == POSITION_TYPE_BUY)
+         currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      else
+         currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+      double profitPips;
+
+      if(type == POSITION_TYPE_BUY)
+         profitPips = (currentPrice - openPrice) / pip;
+      else
+         profitPips = (openPrice - currentPrice) / pip;
+
+      if(profitPips < TrailingStartPips)
+         continue;
+
+      double newSL;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         newSL = currentPrice - TrailingStopPips * pip;
+
+         if(currentSL == 0 || newSL > currentSL)
+         {
+            trade.PositionModify(
+               ticket,
+               NormalizeDouble(newSL, _Digits),
+               currentTP
+            );
+         }
+      }
+      else
+      {
+         newSL = currentPrice + TrailingStopPips * pip;
+
+         if(currentSL == 0 || newSL < currentSL)
+         {
+            trade.PositionModify(
+               ticket,
+               NormalizeDouble(newSL, _Digits),
+               currentTP
+            );
+         }
+      }
+   }
+}
+
+//====================================================================
+// NEW BAR CHECK
+//====================================================================
+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime == 0)
+      return false;
+
+   if(currentBarTime != LastBarTime)
+   {
+      LastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// EXPERT INITIALIZATION
+//====================================================================
+
+int OnInit()
+{
+   //--- Create EMA handles
+   hFastEMA = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      FastEMA,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   hSlowEMA = iMA(
+      _Symbol,
+      PERIOD_CURRENT,
+      SlowEMA,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   //--- Create MACD
+   hMACD = iMACD(
+      _Symbol,
+      PERIOD_CURRENT,
+      MACDFast,
+      MACDSlow,
+      MACDSignal,
+      PRICE_CLOSE
+   );
+
+   //--- Create Stochastic
+   hStoch = iStochastic(
+      _Symbol,
+      PERIOD_CURRENT,
+      StochK,
+      StochD,
+      StochSlowing,
+      MODE_SMA,
+      STO_LOWHIGH
+   );
+
+   //--- Create ATR
+   hATR = iATR(
+      _Symbol,
+      PERIOD_CURRENT,
+      ATRPeriod
+   );
+
+   //--- Check handles
+   if(hFastEMA == INVALID_HANDLE)
+   {
+      Print("Failed to create Fast EMA handle.");
+      return INIT_FAILED;
+   }
+
+   if(hSlowEMA == INVALID_HANDLE)
+   {
+      Print("Failed to create Slow EMA handle.");
+      return INIT_FAILED;
+   }
+
+   if(hMACD == INVALID_HANDLE)
+   {
+      Print("Failed to create MACD handle.");
+      return INIT_FAILED;
+   }
+
+   if(hStoch == INVALID_HANDLE)
+   {
+      Print("Failed to create Stochastic handle.");
+      return INIT_FAILED;
+   }
+
+   if(hATR == INVALID_HANDLE)
+   {
+      Print("Failed to create ATR handle.");
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+
+   Print("==========================================");
+   Print("Thinkwealth Smart Signal Pro EA");
+   Print("Version 1.0");
+   Print("Initialization successful.");
+   Print("Symbol: ", _Symbol);
+   Print("Timeframe: ", EnumToString(PERIOD_CURRENT));
+   Print("==========================================");
+
+   return INIT_SUCCEEDED;
+}
+
+//====================================================================
+// EXPERT DEINITIALIZATION
+//====================================================================
+
+void OnDeinit(const int reason)
+{
+   if(hFastEMA != INVALID_HANDLE)
+      IndicatorRelease(hFastEMA);
+
+   if(hSlowEMA != INVALID_HANDLE)
+      IndicatorRelease(hSlowEMA);
+
+   if(hMACD != INVALID_HANDLE)
+      IndicatorRelease(hMACD);
+
+   if(hStoch != INVALID_HANDLE)
+      IndicatorRelease(hStoch);
+
+   if(hATR != INVALID_HANDLE)
+      IndicatorRelease(hATR);
+
+   Print("Thinkwealth Smart Signal Pro EA stopped.");
+}
+
+//====================================================================
+// MAIN TICK FUNCTION
+//====================================================================
+
+void OnTick()
+{
+   //--- Always manage open trades
+   ManageBreakEven();
+   ManageTrailingStop();
+
+   //--- Only evaluate new entries once per candle
+   if(!IsNewBar())
+      return;
+
+   //--- Check trading hours
+   if(!IsTradingHour())
+      return;
+
+   //--- Check spread
+   if(!IsSpreadOK())
+      return;
+
+   //--- Prevent multiple positions
+   if(OnePositionOnly && HasOpenPosition())
+      return;
+
+   //--- BUY
+   if(AllowBuy && BuySignal())
+   {
+      OpenBuy();
+      return;
+   }
+
+   //--- SELL
+   if(AllowSell && SellSignal())
+   {
+      OpenSell();
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| END OF THINKWEALTH SMART SIGNAL PRO EA                           |
+//+------------------------------------------------------------------+
