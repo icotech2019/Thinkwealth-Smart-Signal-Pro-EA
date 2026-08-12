@@ -66,7 +66,13 @@ Future versions may include additional trading tools, automated analysis, alerts
 
 ## Contact
 
-Thinkwealth Smart Signal Pro EA
+**Project Lead:** Nwobodo Solomon IKechukwu
+
+**Email:** thinkwell4world27@gmail.com
+
+**Phone:** 08066117106
+
+**Project:** Thinkwealth Smart Signal Pro EA
 
 Forex Technology & Trading Solutions
 
